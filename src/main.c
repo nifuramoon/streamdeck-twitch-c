@@ -12,6 +12,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
@@ -23,6 +24,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -56,6 +58,12 @@ enum page {
     PAGE_HOME, PAGE_TW, PAGE_LV, PAGE_TX, PAGE_NX,
     PAGE_ST, PAGE_SD, PAGE_OA, PAGE_FN, PAGE_UI
 };
+
+/* ================================================================
+ * Scroll mode
+ * ================================================================ */
+enum scroll_mode { SCROLL_TITLE, SCROLL_CATEGORY };
+
 /* ================================================================
  * Global State
  * ================================================================ */
@@ -91,7 +99,7 @@ static float g_cat_w[MAX_FOLLOWS];
 static bool g_cat_wrapped[MAX_FOLLOWS];
 static int g_views[MAX_FOLLOWS];
 static double g_started_at[MAX_FOLLOWS];
-static char g_scroll_mode[32] = "title";
+static enum scroll_mode g_scroll_mode = SCROLL_TITLE;
 static int g_last_online_count = 0;
 static bool g_prev_online[MAX_FOLLOWS];
 static int g_prev_online_len = 0;
@@ -193,17 +201,18 @@ static void lru_set(const char *key, image *img) {
  * ================================================================ */
 static image *resize72(image *src) {
     image *dst = image_create(72, 72);
-    for (int y = 0; y < 72; y++)
+    if (!dst) return NULL;
+    int sx_mul = (src->width  << 16) / 72;
+    int sy_mul = (src->height << 16) / 72;
+    for (int y = 0; y < 72; y++) {
+        int sy = (y * sy_mul) >> 16;
+        const uint8_t *src_row = src->data + (size_t)sy * src->width * 4;
+        uint8_t *dst_row = dst->data + (size_t)y * 72 * 4;
         for (int x = 0; x < 72; x++) {
-            int sx = x * src->width / 72;
-            int sy = y * src->height / 72;
-            size_t soff = (size_t)(sy * src->width + sx) * 4;
-            size_t doff = (size_t)(y * 72 + x) * 4;
-            dst->data[doff] = src->data[soff];
-            dst->data[doff+1] = src->data[soff+1];
-            dst->data[doff+2] = src->data[soff+2];
-            dst->data[doff+3] = src->data[soff+3];
+            int sx = (x * sx_mul) >> 16;
+            *(uint32_t*)(dst_row + x * 4) = *(uint32_t*)(src_row + sx * 4);
         }
+    }
     return dst;
 }
 
@@ -495,19 +504,15 @@ static json_val *twitch_api_get(const char *base, const char *params) {
 }
 
 /* ================================================================
- * Fetch & render functions (translated from render.go + twitch.go)
+ * Fetch & render functions
  * ================================================================ */
 static void draw_scroll_text(image *img, int y, const char *txt, float ofs,
-                             uint8_t r, uint8_t g, uint8_t b) {
-    char buf[512];
-    snprintf(buf, sizeof(buf), "%s   ", txt);
-    int tw = measure_text(buf, 13);
+                             uint8_t r, uint8_t g, uint8_t b, int tw) {
     if (tw <= 0) return;
-
     int xp = -(int)fmodf(ofs, (float)tw);
-    draw_text(img, xp, y, buf, r, g, b, 14);
+    draw_text(img, xp, y, txt, r, g, b, 14);
     if (xp + tw < 72)
-        draw_text(img, xp + tw, y, buf, r, g, b, 14);
+        draw_text(img, xp + tw, y, txt, r, g, b, 14);
 }
 
 static const char *viewer_count_str(int v) {
@@ -530,14 +535,13 @@ static image *tw_img(const char *prof_url, const char *login) {
 
     image *prof = fetch_prof(prof_url);
     if (prof) {
-        for (int y = 0; y < 72; y++)
-            for (int x = 0; x < 72; x++) {
-                size_t s = (size_t)(y*72+x)*4;
-                img->data[s] = prof->data[s];
-                img->data[s+1] = prof->data[s+1];
-                img->data[s+2] = prof->data[s+2];
-                img->data[s+3] = 255;
-            }
+        for (int y = 0; y < 72; y++) {
+            memcpy(img->data + y * 288, prof->data + y * 288, 288);
+        }
+        for (int y = 0; y < 72; y++) {
+            uint8_t *row = img->data + y * 288;
+            for (int x = 0; x < 72; x++) row[x*4+3] = 255;
+        }
     } else {
         render_fill(img, 30, 30, 30);
         draw_text(img, 4, 25, login, 255, 255, 255, 12);
@@ -553,7 +557,7 @@ static image *tw_img(const char *prof_url, const char *login) {
     pthread_mutex_lock(&g_state_mu);
     v = g_views[idx];
     st = g_started_at[idx];
-    if (strcmp(g_scroll_mode, "category") == 0) {
+    if (g_scroll_mode == SCROLL_CATEGORY) {
         strncpy(txt, g_categories[idx], sizeof(txt) - 1);
         ofs = g_cat_ofs[idx];
     } else {
@@ -585,11 +589,15 @@ static image *tw_img(const char *prof_url, const char *login) {
 
     if (txt[0]) {
         uint8_t tr = 255, tg = 217, tb = 0;
-        if (strcmp(g_scroll_mode, "category") == 0) {
+        int tw = 0;
+        if (g_scroll_mode == SCROLL_CATEGORY) {
             tr = 200; tg = 245; tb = 255;
+            tw = (int)g_cat_w[idx];
+        } else {
+            tw = (int)g_title_w[idx];
         }
         render_rect(img, 0, 72-21, 72, 21, 0, 0, 0);
-        draw_scroll_text(img, 72-21, txt, ofs, tr, tg, tb);
+        draw_scroll_text(img, 72-21, txt, ofs, tr, tg, tb, tw);
     }
 
     return img;
@@ -612,10 +620,10 @@ static void render_home(void) {
 
 static void render_tw(void) {
     if (!g_dev) return;
-    static unsigned char prev_sha[16][20] = {{0}};
+    static unsigned char prev_sha[MAX_KEYS][20] = {{0}};
     static int frame = 0;
     frame++;
-    int capture = g_debug_mode ? 1 : 0;
+    int capture = g_debug_mode && (frame % 30 == 0) ? 1 : 0;
     for (int i = 0; i < MAX_TWITCH_KEYS; i++) {
         image *img;
         if (i < g_tw_order_len && g_tw_order[i]) {
@@ -647,11 +655,11 @@ static void render_tw(void) {
             memcpy(prev_sha[i], h, 20);
             device_set_key(g_dev, i, d, (size_t)72*72*4);
         }
-    if (capture) {
-        char pname[80];
-        snprintf(pname, sizeof(pname), "/tmp/streamdeck/btn%d.png", i);
-        image_save_png(img, pname);
-    }
+        if (capture) {
+            char pname[80];
+            snprintf(pname, sizeof(pname), "/tmp/streamdeck/btn%d.png", i);
+            image_save_png(img, pname);
+        }
         image_free(img);
     }
     image *img = key_text_bg("ホーム", 50, 0, 50);
@@ -826,26 +834,22 @@ static void render_ui(void) {
 static bool irc_connect(void) {
     if (g_at[0] == '\0' || g_irc_username[0] == '\0') return false;
 
-    struct hostent *he = gethostbyname("irc.chat.twitch.tv");
-    if (!he) return false;
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo("irc.chat.twitch.tv", "6667", &hints, &res) != 0) return false;
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return false;
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(6667);
-    memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) { freeaddrinfo(res); return false; }
 
     struct timeval tv = {5, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(sock);
-        return false;
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        close(sock); freeaddrinfo(res); return false;
     }
+    freeaddrinfo(res);
 
     char buf[512];
     snprintf(buf, sizeof(buf), "PASS oauth:%s\r\n", g_at);
@@ -856,6 +860,7 @@ static bool irc_connect(void) {
     write(sock, buf, strlen(buf));
 
     g_irc_sock = sock;
+    g_irc_joined[0] = false;
     g_irc_joined_len = 0;
     g_last_ping = time(NULL);
     infoLog("IRC connected as %s", g_irc_username);
@@ -970,7 +975,6 @@ static void page_show(enum page pg, const char *ctx, bool push) {
     else g_live[0] = '\0';
 
     /* Reset per-key image cache on page switch */
-    extern void device_reset_cache(device *dev);
     if (g_dev) device_reset_cache(g_dev);
 
     switch (pg) {
@@ -1183,20 +1187,31 @@ static void on_key(int k) {
 /* ================================================================
  * Background fetch / scroll
  * ================================================================ */
+typedef struct { char lg[MAX_STR]; int viewers; double started; char title[256]; char game[256]; } stream_info;
+
+static int cmp_stream(const void *a, const void *b) {
+    const stream_info *sa = a;
+    const stream_info *sb = b;
+    if (sb->viewers > sa->viewers) return 1;
+    if (sb->viewers < sa->viewers) return -1;
+    return 0;
+}
+
 static void fetch_streams(void) {
     if (g_followed_len == 0) return;
 
-    /* Build URL with all IDs */
+    /* Build URL with all IDs (pointer advance instead of strncat) */
     char url[8192] = "https://api.twitch.tv/helix/streams?";
+    char *p = url + strlen(url);
+    const char *url_end = url + sizeof(url) - 1;
     int first = 1;
     for (int i = 0; i < g_followed_len; i++) {
         json_val *u = lu_get(g_followed[i]);
         if (!u) continue;
         json_val *idv = json_obj_get(u, "id");
         if (!idv || idv->type != JSON_STR) continue;
-        char part[256];
-        snprintf(part, sizeof(part), "%suser_id=%s", first ? "" : "&", idv->str);
-        strncat(url, part, sizeof(url)-strlen(url)-1);
+        int n = snprintf(p, (size_t)(url_end - p), "%suser_id=%s", first ? "" : "&", idv->str);
+        if (n > 0 && p + n < url_end) p += n;
         first = 0;
     }
 
@@ -1209,7 +1224,6 @@ static void fetch_streams(void) {
     if (!data || data->type != JSON_ARR) { json_free(j); return; }
 
     /* Collect online users */
-    typedef struct { char lg[MAX_STR]; int viewers; double started; char title[256]; char game[256]; } stream_info;
     stream_info online[64];
     int online_len = 0;
 
@@ -1250,12 +1264,7 @@ static void fetch_streams(void) {
         online_len++;
     }
 
-    /* Bubble sort by viewer count */
-    for (int i = 0; i < online_len; i++)
-        for (int j = i+1; j < online_len; j++)
-            if (online[j].viewers > online[i].viewers) {
-                stream_info tmp = online[i]; online[i] = online[j]; online[j] = tmp;
-            }
+    qsort(online, (size_t)online_len, sizeof(stream_info), cmp_stream);
 
     if (online_len > MAX_TWITCH_KEYS) online_len = MAX_TWITCH_KEYS;
 
@@ -1310,52 +1319,60 @@ static void fetch_streams(void) {
     json_free(j);
 }
 
-static void scroll_all(void) {
+static bool scroll_all(void) {
+    bool changed = false;
     pthread_mutex_lock(&g_state_mu);
 
-    if (strcmp(g_scroll_mode, "title") == 0) {
+    if (g_scroll_mode == SCROLL_TITLE) {
         bool all_done = true;
         for (int i = 0; i < g_tw_order_len; i++) {
             int idx = lu_find_idx(g_tw_order[i]);
             if (idx < 0) continue;
+            float prev = g_title_ofs[idx];
             g_title_ofs[idx] += g_title_step[idx];
             if (g_title_w[idx] > 0 &&
                 fmodf(g_title_ofs[idx], g_title_w[idx]) + g_title_step[idx] >= g_title_w[idx])
                 g_title_wrapped[idx] = true;
             if (!g_title_wrapped[idx]) all_done = false;
+            if (g_title_ofs[idx] != prev) changed = true;
         }
         if (all_done && g_tw_order_len > 0) {
-            strncpy(g_scroll_mode, "category", sizeof(g_scroll_mode)-1);
+            g_scroll_mode = SCROLL_CATEGORY;
             for (int i = 0; i < g_tw_order_len; i++) {
                 int idx = lu_find_idx(g_tw_order[i]);
                 if (idx < 0) continue;
                 g_cat_ofs[idx] = 0;
                 g_cat_wrapped[idx] = false;
             }
+            changed = true;
         }
-    } else if (strcmp(g_scroll_mode, "category") == 0) {
+    } else if (g_scroll_mode == SCROLL_CATEGORY) {
         bool all_done = true;
         for (int i = 0; i < g_tw_order_len; i++) {
             int idx = lu_find_idx(g_tw_order[i]);
             if (idx < 0) continue;
+            float prev = g_cat_ofs[idx];
             g_cat_ofs[idx] += g_cat_step[idx];
             if (g_cat_w[idx] > 0 &&
                 fmodf(g_cat_ofs[idx], g_cat_w[idx]) + g_cat_step[idx] >= g_cat_w[idx])
                 g_cat_wrapped[idx] = true;
             if (!g_cat_wrapped[idx]) all_done = false;
+            if (g_cat_ofs[idx] != prev) changed = true;
         }
         if (all_done && g_tw_order_len > 0) {
-            strncpy(g_scroll_mode, "title", sizeof(g_scroll_mode)-1);
+            g_scroll_mode = SCROLL_TITLE;
             for (int i = 0; i < g_tw_order_len; i++) {
                 int idx = lu_find_idx(g_tw_order[i]);
                 if (idx < 0) continue;
                 g_title_ofs[idx] = 0;
                 g_title_wrapped[idx] = false;
             }
+            changed = true;
         }
     }
 
     pthread_mutex_unlock(&g_state_mu);
+    return changed;
 }
 
 /* ================================================================
@@ -1414,14 +1431,19 @@ static void init_follows(void) {
 
 static void fetch_users(char **logins, int len) {
     for (int i = 0; i < len; i += 100) {
-        int end = (i + 100 < len) ? i + 100 : len;
+        int batch_end = (i + 100 < len) ? i + 100 : len;
         char url[8192] = "https://api.twitch.tv/helix/users?";
-        for (int j = i; j < end; j++) {
-            char part[256];
-            snprintf(part, sizeof(part), "login=%s&", logins[j]);
-            strncat(url, part, sizeof(url)-strlen(url)-1);
+        char *p = url + strlen(url);
+        const char *url_end = url + sizeof(url) - 1;
+        for (int j = i; j < batch_end; j++) {
+            int n = snprintf(p, (size_t)(url_end - p), "login=%s&", logins[j]);
+            if (n > 0 && p + n < url_end) p += n;
         }
-        url[strlen(url)-1] = '\0'; /* remove trailing & */
+        if (p > url && *(p-1) == '&') {
+            *(p-1) = '\0';
+        } else {
+            *p = '\0';
+        }
 
         json_val *j = twitch_api_get(url, NULL);
         if (!j) continue;
@@ -1458,28 +1480,22 @@ static void main_loop(void) {
     uint8_t input_buf[32];
     uint8_t prev_keys[MAX_KEYS] = {0};
 
-    /* Force render for capture */
     if (g_dev && g_page == PAGE_TW) render_tw();
 
     while (1) {
         time_t now = time(NULL);
+        bool force_render = false;
 
         /* Fetch streams every FETCH_IV */
         if (difftime(now, last_fetch) >= FETCH_IV) {
             last_fetch = now;
             fetch_streams();
-            if (g_page == PAGE_TW) {
-                static int prev_online = -1;
-                if (g_last_online_count != prev_online) {
-                    prev_online = g_last_online_count;
-                }
-                render_tw();
-            }
+            force_render = true;
         }
 
-        /* Scroll every frame */
-        scroll_all();
-        if (g_page == PAGE_TW) render_tw();
+        /* Scroll & render only when changed */
+        bool scrolled = scroll_all();
+        if ((scrolled || force_render) && g_page == PAGE_TW) render_tw();
 
         /* Idle timeout */
         if (g_page != PAGE_TW && g_page != PAGE_LV &&
@@ -1496,9 +1512,7 @@ static void main_loop(void) {
                     uint8_t cur = input_buf[4+i];
                     if (cur != prev_keys[i]) {
                         prev_keys[i] = cur;
-                        if (cur == 1) {
-                            on_key(i);
-                        }
+                        if (cur == 1) on_key(i);
                     }
                 }
             }
