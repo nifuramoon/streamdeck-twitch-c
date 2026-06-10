@@ -1,0 +1,4 @@
+obj/
+streamdeck-twitch
+*.o
+*.raw
