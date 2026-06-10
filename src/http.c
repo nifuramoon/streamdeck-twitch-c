@@ -4,8 +4,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <curl/curl.h>
+#include <pthread.h>
 
-/* ── 伸長バッファ（64 KB プリアロケートで realloc 回数を 0 に近づける） ── */
+/* ── 伸長バッファ（64 KB プリアロケート） ── */
 struct mem_buf {
     char *data;
     size_t len;
@@ -40,41 +41,60 @@ static void mb_append(struct mem_buf *mb, const char *ptr, size_t sz) {
 
 static size_t curl_write_cb(void *ptr, size_t size, size_t nmemb, void *user) {
     size_t total = size * nmemb;
-    struct mem_buf *mb = (struct mem_buf *)user;
-    mb_append(mb, (const char *)ptr, total);
+    mb_append((struct mem_buf *)user, (const char *)ptr, total);
     return total;
 }
 
-/* ── グローバル状態（既存 API 互換） ── */
+/* ── グローバル curl ハンドル（接続再利用） ── */
+static CURL *g_curl = NULL;
+static pthread_mutex_t g_curl_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_extra_header[2048] = {0};
 
-static CURL *curl_easy_new(void) {
-    static int global_init = 0;
-    if (!global_init) {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        global_init = 1;
-    }
-    return curl_easy_init();
+static CURL *curl_get_handle(void) {
+    if (g_curl) return g_curl;
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    g_curl = curl_easy_init();
+    if (!g_curl) return NULL;
+
+    curl_easy_setopt(g_curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(g_curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(g_curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(g_curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(g_curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(g_curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(g_curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(g_curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(g_curl, CURLOPT_TCP_KEEPIDLE, 120L);
+    curl_easy_setopt(g_curl, CURLOPT_TCP_KEEPINTVL, 60L);
+    curl_easy_setopt(g_curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(g_curl, CURLOPT_ACCEPT_ENCODING, "");
+    return g_curl;
 }
 
 static http_resp *do_curl_req(const char *url, const char *post_body,
                               const char *bearer, bool is_form) {
-    CURL *c = curl_easy_new();
+    pthread_mutex_lock(&g_curl_mu);
+    CURL *c = curl_get_handle();
     if (!c) {
+        pthread_mutex_unlock(&g_curl_mu);
         http_resp *r = (http_resp *)calloc(1, sizeof(http_resp));
         r->status = -1;
         return r;
     }
 
     struct mem_buf mb = {0};
-    mb_init(&mb, 65536);  /* 多くの API レスポンスは 64 KB 以内で収まり realloc 不要 */
+    mb_init(&mb, 65536);
+
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &mb);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS, NULL);
+    curl_easy_setopt(c, CURLOPT_HTTPGET, 0L);
 
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "User-Agent: streamdeck-twitch/1.0");
 
-    if (g_extra_header[0]) {
+    if (g_extra_header[0])
         headers = curl_slist_append(headers, g_extra_header);
-    }
 
     if (bearer && bearer[0]) {
         char auth[2048];
@@ -84,32 +104,16 @@ static http_resp *do_curl_req(const char *url, const char *post_body,
     }
 
     if (post_body) {
-        if (is_form) {
-            headers = curl_slist_append(headers,
-                "Content-Type: application/x-www-form-urlencoded");
-        } else {
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-        }
+        headers = curl_slist_append(headers,
+            is_form ? "Content-Type: application/x-www-form-urlencoded"
+                    : "Content-Type: application/json");
         curl_easy_setopt(c, CURLOPT_POSTFIELDS, post_body);
         curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(post_body));
+    } else {
+        curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
     }
 
-    /* ── libcurl 最適化設定 ── */
-    curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &mb);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
-    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
-    curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);   /* 接続再利用を最大化 */
-    curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE, 120L);
-    curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 60L);
-    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);        /* マルチスレッド安全 */
-    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, ""); /* 自動圧縮解凍 (gzip/deflate) */
 
     CURLcode res = curl_easy_perform(c);
     http_resp *r = (http_resp *)calloc(1, sizeof(http_resp));
@@ -127,7 +131,7 @@ static http_resp *do_curl_req(const char *url, const char *post_body,
     }
 
     curl_slist_free_all(headers);
-    curl_easy_cleanup(c);
+    pthread_mutex_unlock(&g_curl_mu);
     return r;
 }
 
@@ -144,6 +148,11 @@ void http_set_extra_header(const char *hdr) {
 }
 
 void http_close_all(void) {
+    if (g_curl) {
+        curl_easy_cleanup(g_curl);
+        g_curl = NULL;
+    }
+    curl_global_cleanup();
 }
 
 http_resp *http_get(const char *url, const char *bearer_token) {

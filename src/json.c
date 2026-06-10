@@ -7,15 +7,19 @@
 
 static json_val *parse_value(const char **p);
 
+static inline int is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
 static void skip_ws(const char **p) {
-    while (**p && isspace((unsigned char)**p)) (*p)++;
+    while (**p && is_ws(**p)) (*p)++;
 }
 
 static char *parse_str_raw(const char **p) {
     skip_ws(p);
     if (**p != '"') return NULL;
     (*p)++;
-    size_t cap = 128, len = 0;
+    size_t cap = 256, len = 0;
     char *s = malloc(cap);
     while (**p && **p != '"') {
         if (**p == '\\') {
@@ -71,7 +75,7 @@ static json_val *parse_arr(const char **p) {
     (*p)++;
     json_val *v = calloc(1, sizeof(json_val));
     v->type = JSON_ARR;
-    size_t cap = 8;
+    size_t cap = 64;
     v->arr.items = malloc(sizeof(json_val) * cap);
     v->arr.len = 0;
     skip_ws(p);
@@ -101,7 +105,7 @@ static json_val *parse_obj(const char **p) {
     (*p)++;
     json_val *v = calloc(1, sizeof(json_val));
     v->type = JSON_OBJ;
-    size_t cap = 8;
+    size_t cap = 64;
     v->obj.pairs = malloc(sizeof(json_pair) * cap);
     v->obj.len = 0;
     skip_ws(p);
@@ -138,9 +142,9 @@ static json_val *parse_value(const char **p) {
         case '"': return parse_str(p);
         case '{': return parse_obj(p);
         case '[': return parse_arr(p);
-        case 't': if (strncmp(*p, "true", 4) == 0) { *p += 4; json_val *v = calloc(1, sizeof(json_val)); v->type = JSON_BOOL; v->b = true; return v; } return NULL;
-        case 'f': if (strncmp(*p, "false", 5) == 0) { *p += 5; json_val *v = calloc(1, sizeof(json_val)); v->type = JSON_BOOL; v->b = false; return v; } return NULL;
-        case 'n': if (strncmp(*p, "null", 4) == 0) { *p += 4; json_val *v = calloc(1, sizeof(json_val)); v->type = JSON_NULL; return v; } return NULL;
+        case 't': if (memcmp(*p, "true", 4) == 0) { *p += 4; json_val *v = calloc(1, sizeof(json_val)); v->type = JSON_BOOL; v->b = true; return v; } return NULL;
+        case 'f': if (memcmp(*p, "false", 5) == 0) { *p += 5; json_val *v = calloc(1, sizeof(json_val)); v->type = JSON_BOOL; v->b = false; return v; } return NULL;
+        case 'n': if (memcmp(*p, "null", 4) == 0) { *p += 4; json_val *v = calloc(1, sizeof(json_val)); v->type = JSON_NULL; return v; } return NULL;
         default:  return parse_num(p);
     }
 }
@@ -148,8 +152,7 @@ static json_val *parse_value(const char **p) {
 json_val *json_parse(const char *input) {
     if (!input) return NULL;
     const char *p = input;
-    json_val *v = parse_value(&p);
-    return v;
+    return parse_value(&p);
 }
 
 static json_val *json_clone_val(json_val *v) {
@@ -185,17 +188,21 @@ json_val *json_clone(json_val *v) {
 
 static void json_free_internal(json_val *v) {
     if (!v) return;
-    if (v->type == JSON_STR) free(v->str);
-    else if (v->type == JSON_ARR) {
-        for (size_t i = 0; i < v->arr.len; i++)
-            json_free_internal(&v->arr.items[i]);
-        free(v->arr.items);
-    } else if (v->type == JSON_OBJ) {
-        for (size_t i = 0; i < v->obj.len; i++) {
-            free(v->obj.pairs[i].key);
-            json_free_internal(&v->obj.pairs[i].val);
-        }
-        free(v->obj.pairs);
+    switch (v->type) {
+        case JSON_STR: free(v->str); break;
+        case JSON_ARR:
+            for (size_t i = 0; i < v->arr.len; i++)
+                json_free_internal(&v->arr.items[i]);
+            free(v->arr.items);
+            break;
+        case JSON_OBJ:
+            for (size_t i = 0; i < v->obj.len; i++) {
+                free(v->obj.pairs[i].key);
+                json_free_internal(&v->obj.pairs[i].val);
+            }
+            free(v->obj.pairs);
+            break;
+        default: break;
     }
 }
 
@@ -278,7 +285,7 @@ static void json_serialize_val(json_val *v, char **buf, size_t *len, size_t *cap
 }
 
 char *json_serialize(json_val *v) {
-    size_t cap = 256, len = 0;
+    size_t cap = 1024, len = 0;
     char *buf = malloc(cap);
     buf[0] = '\0';
     json_serialize_val(v, &buf, &len, &cap);

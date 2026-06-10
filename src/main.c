@@ -32,6 +32,9 @@
 #include <ctype.h>
 #include <curl/curl.h>
 #include <emmintrin.h>
+#include <spawn.h>
+
+extern char **environ;
 
 /* ================================================================
  * Constants
@@ -135,9 +138,23 @@ static const char *g_cache_dir = NULL;
 static char g_cid[MAX_STR], g_cs[MAX_STR], g_at[MAX_STR], g_rt[MAX_STR], g_uid[MAX_STR];
 
 /* ================================================================
+ * Helpers
+ * ================================================================ */
+static inline void safe_strcpy(char *dst, size_t size, const char *src) {
+    if (!src || size == 0) return;
+    size_t len = strlen(src);
+    if (len >= size) len = size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+/* ================================================================
  * Cache helpers
  * ================================================================ */
 static void ensure_cache_dir(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
     static char buf[1024];
@@ -185,13 +202,13 @@ static void lru_set(const char *key, image *img) {
         int evict = g_lru_keys[MAX_LRU-1];
         image_free(g_lru_cache[evict].img);
         g_lru_cache[evict].img = img;
-        strncpy(g_lru_cache[evict].key, key, MAX_STR-1);
+        safe_strcpy(g_lru_cache[evict].key, sizeof(g_lru_cache[evict].key), key);
         for (int i = MAX_LRU-1; i > 0; i--) g_lru_keys[i] = g_lru_keys[i-1];
         g_lru_keys[0] = evict;
         return;
     }
     int n = g_lru_len++;
-    strncpy(g_lru_cache[n].key, key, MAX_STR-1);
+    safe_strcpy(g_lru_cache[n].key, sizeof(g_lru_cache[n].key), key);
     g_lru_cache[n].img = img;
     for (int i = n; i > 0; i--) g_lru_keys[i] = g_lru_keys[i-1];
     g_lru_keys[0] = n;
@@ -284,27 +301,20 @@ static image *key_text_bg(const char *text, uint8_t br, uint8_t bg, uint8_t bb) 
 }
 
 /* ================================================================
- * Follows cache
+ * Follows cache (簡易 JSON、シリアライズオーバーヘッド削減)
  * ================================================================ */
 static void save_followed_cache(char **list, int len) {
     char path[1024];
     cache_path("followed.json", path, sizeof(path));
-
-    json_val arr;
-    arr.type = JSON_ARR;
-    arr.arr.len = (size_t)len;
-    arr.arr.items = calloc((size_t)len, sizeof(json_val));
-    for (int i = 0; i < len; i++) {
-        arr.arr.items[i].type = JSON_STR;
-        arr.arr.items[i].str = list[i];
-    }
-    char *s = json_serialize(&arr);
-    free(arr.arr.items);
-    if (!s) return;
-
     FILE *f = fopen(path, "w");
-    if (f) { fprintf(f, "%s\n", s); fclose(f); }
-    free(s);
+    if (!f) return;
+    fputc('[', f);
+    for (int i = 0; i < len; i++) {
+        if (i > 0) fputc(',', f);
+        fprintf(f, "\"%s\"", list[i]);
+    }
+    fputs("]\n", f);
+    fclose(f);
 }
 
 static char **load_followed_cache(int *out_len) {
@@ -334,30 +344,24 @@ static char **load_followed_cache(int *out_len) {
 }
 
 /* ================================================================
- * Prev online state
+ * Prev online state (簡易 JSON)
  * ================================================================ */
 void save_prev_online(bool *online, int len) {
     char path[1024];
     cache_path("prev_online.json", path, sizeof(path));
 
-    json_val obj;
-    obj.type = JSON_OBJ;
-    obj.obj.pairs = calloc((size_t)len, sizeof(json_pair));
-    obj.obj.len = 0;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fputc('{', f);
+    int first = 1;
     for (int i = 0; i < g_followed_len && i < len; i++) {
         if (!online[i] || !g_followed[i]) continue;
-        obj.obj.pairs[obj.obj.len].key = strdup(g_followed[i]);
-        obj.obj.pairs[obj.obj.len].val.type = JSON_BOOL;
-        obj.obj.pairs[obj.obj.len].val.b = true;
-        obj.obj.len++;
+        if (!first) fputc(',', f);
+        first = 0;
+        fprintf(f, "\"%s\":true", g_followed[i]);
     }
-    char *s = json_serialize(&obj);
-    for (size_t i = 0; i < obj.obj.len; i++) free(obj.obj.pairs[i].key);
-    free(obj.obj.pairs);
-    if (!s) return;
-    FILE *f = fopen(path, "w");
-    if (f) { fprintf(f, "%s\n", s); fclose(f); }
-    free(s);
+    fputs("}\n", f);
+    fclose(f);
 }
 
 static void load_prev_online(void) {
@@ -399,12 +403,12 @@ static const char *id2lg_find(const char *id) {
 static void id2lg_set(const char *id, const char *lg) {
     for (int i = 0; i < g_id2lg_len; i++)
         if (strcmp(g_id2lg_keys[i], id) == 0) {
-            strncpy(g_id2lg_vals[i], lg, MAX_STR-1);
+            safe_strcpy(g_id2lg_vals[i], sizeof(g_id2lg_vals[i]), lg);
             return;
         }
     if (g_id2lg_len >= MAX_FOLLOWS) return;
-    strncpy(g_id2lg_keys[g_id2lg_len], id, MAX_STR-1);
-    strncpy(g_id2lg_vals[g_id2lg_len], lg, MAX_STR-1);
+    safe_strcpy(g_id2lg_keys[g_id2lg_len], sizeof(g_id2lg_keys[g_id2lg_len]), id);
+    safe_strcpy(g_id2lg_vals[g_id2lg_len], sizeof(g_id2lg_vals[g_id2lg_len]), lg);
     g_id2lg_len++;
 }
 
@@ -419,18 +423,18 @@ static json_val *lu_get(const char *lg) {
 }
 
 /* ================================================================
- * Platform helpers (Linux)
+ * Platform helpers (Linux) — system() 排除
  * ================================================================ */
 static void platform_open_browser(const char *url) {
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "xdg-open '%s' &", url);
-    system(cmd);
+    pid_t pid;
+    char *argv[] = {"xdg-open", (char*)url, NULL};
+    posix_spawnp(&pid, "xdg-open", NULL, NULL, argv, environ);
 }
 
 static void platform_speak_text(const char *text) {
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "espeak-ng -v ja '%s' 2>/dev/null &", text);
-    system(cmd);
+    pid_t pid;
+    char *argv[] = {"espeak-ng", "-v", "ja", (char*)text, NULL};
+    posix_spawnp(&pid, "espeak-ng", NULL, NULL, argv, environ);
 }
 
 static json_val *twitch_api_call(const char *url) {
@@ -472,13 +476,13 @@ static int token_refresh_full(void) {
     json_val *v;
     v = json_obj_get(j, "access_token");
     if (v && v->type == JSON_STR) {
-        strncpy(g_config.access_token, v->str, MAX_STR-1);
-        strncpy(g_at, v->str, MAX_STR-1);
+        safe_strcpy(g_config.access_token, sizeof(g_config.access_token), v->str);
+        safe_strcpy(g_at, sizeof(g_at), v->str);
     }
     v = json_obj_get(j, "refresh_token");
     if (v && v->type == JSON_STR) {
-        strncpy(g_config.refresh_token, v->str, MAX_STR-1);
-        strncpy(g_rt, v->str, MAX_STR-1);
+        safe_strcpy(g_config.refresh_token, sizeof(g_config.refresh_token), v->str);
+        safe_strcpy(g_rt, sizeof(g_rt), v->str);
     }
     json_free(j);
     config_save(&g_config);
@@ -559,10 +563,10 @@ static image *tw_img(const char *prof_url, const char *login) {
     v = g_views[idx];
     st = g_started_at[idx];
     if (g_scroll_mode == SCROLL_CATEGORY) {
-        strncpy(txt, g_categories[idx], sizeof(txt) - 1);
+        safe_strcpy(txt, sizeof(txt), g_categories[idx]);
         ofs = g_cat_ofs[idx];
     } else {
-        strncpy(txt, g_titles[idx], sizeof(txt) - 1);
+        safe_strcpy(txt, sizeof(txt), g_titles[idx]);
         ofs = g_title_ofs[idx];
     }
     pthread_mutex_unlock(&g_state_mu);
@@ -642,7 +646,6 @@ static void render_tw(void) {
         }
         uint8_t *d = img->data;
         unsigned char h[20] = {0};
-        /* SSE2: XOR hash of 20736 bytes */
         __m128i x0 = _mm_setzero_si128(), x1 = _mm_setzero_si128();
         for (int j = 0; j < 72*72*4; j += 32) {
             __m128i v0 = _mm_loadu_si128((__m128i*)(d + j));
@@ -887,10 +890,10 @@ static bool fetch_irc_username(void) {
     json_val *user = json_arr_get(data, 0);
     json_val *v = json_obj_get(user, "login");
     if (v && v->type == JSON_STR) {
-        strncpy(g_irc_username, v->str, MAX_STR-1);
-        strncpy(g_uid, v->str, MAX_STR-1);
-        strncpy(g_config.user_id, v->str, MAX_STR-1);
-        strncpy(g_config.channel_name, v->str, MAX_STR-1);
+        safe_strcpy(g_irc_username, sizeof(g_irc_username), v->str);
+        safe_strcpy(g_uid, sizeof(g_uid), v->str);
+        safe_strcpy(g_config.user_id, sizeof(g_config.user_id), v->str);
+        safe_strcpy(g_config.channel_name, sizeof(g_config.channel_name), v->str);
         config_save(&g_config);
         infoLog("IRC username: %s", g_irc_username);
         json_free(j);
@@ -907,7 +910,7 @@ static void *irc_thread(void *arg) {
 
         if (g_irc_username[0] == '\0') {
             if (!fetch_irc_username()) {
-                strncpy(g_irc_username, "justinfan12345", MAX_STR-1);
+                safe_strcpy(g_irc_username, sizeof(g_irc_username), "justinfan12345");
             }
         }
 
@@ -918,7 +921,6 @@ static void *irc_thread(void *arg) {
             }
         }
 
-        /* Join channel if needed */
         if (g_live[0] && !g_irc_joined[0]) {
             char buf[512];
             snprintf(buf, sizeof(buf), "JOIN #%s\r\n", g_live);
@@ -927,14 +929,12 @@ static void *irc_thread(void *arg) {
             g_irc_joined_len = 1;
         }
 
-        /* Keepalive */
         time_t now = time(NULL);
         if (difftime(now, g_last_ping) > 120) {
             write(g_irc_sock, "PING :tmi.twitch.tv\r\n", 21);
             g_last_ping = now;
         }
 
-        /* Read */
         struct pollfd pfd = {g_irc_sock, POLLIN, 0};
         int ret = poll(&pfd, 1, 100);
         if (ret > 0 && (pfd.revents & POLLIN)) {
@@ -962,7 +962,7 @@ static void *irc_thread(void *arg) {
 static void push_stack(enum page pg, const char *ctx) {
     if (g_stack_len < MAX_STACK) {
         g_stack[g_stack_len].pg = pg;
-        strncpy(g_stack[g_stack_len].ctx, ctx, MAX_STR-1);
+        safe_strcpy(g_stack[g_stack_len].ctx, sizeof(g_stack[g_stack_len].ctx), ctx);
         g_stack_len++;
     }
 }
@@ -972,10 +972,9 @@ static void page_show(enum page pg, const char *ctx, bool push) {
         push_stack(g_page, g_live);
     }
     g_page = pg;
-    if (ctx) strncpy(g_live, ctx, MAX_STR-1);
+    if (ctx) safe_strcpy(g_live, sizeof(g_live), ctx);
     else g_live[0] = '\0';
 
-    /* Reset per-key image cache on page switch */
     if (g_dev) device_reset_cache(g_dev);
 
     switch (pg) {
@@ -1056,7 +1055,12 @@ static void handle_st(int k) {
     if (k == 14) { page_show(PAGE_HOME, "", false); return; }
     switch (k) {
         case 0: page_show(PAGE_SD, "", true); break;
-        case 1: system("reboot &"); break;
+        case 1: {
+            pid_t pid;
+            char *argv[] = {"reboot", NULL};
+            posix_spawnp(&pid, "reboot", NULL, NULL, argv, environ);
+            break;
+        }
         case 2:
             g_debug_mode = !g_debug_mode;
             infoLog("Debug mode %s", g_debug_mode ? "ON" : "OFF");
@@ -1128,25 +1132,23 @@ static void start_oauth(void) {
     }
     oauth_stop_server();
 
-    /* Copy token back to config */
-    strncpy(g_config.access_token, t.access_token, MAX_STR-1);
-    strncpy(g_config.refresh_token, t.refresh_token, MAX_STR-1);
-    strncpy(g_at, t.access_token, MAX_STR-1);
-    strncpy(g_rt, t.refresh_token, MAX_STR-1);
+    safe_strcpy(g_config.access_token, sizeof(g_config.access_token), t.access_token);
+    safe_strcpy(g_config.refresh_token, sizeof(g_config.refresh_token), t.refresh_token);
+    safe_strcpy(g_at, sizeof(g_at), t.access_token);
+    safe_strcpy(g_rt, sizeof(g_rt), t.refresh_token);
     config_save(&g_config);
 
     infoLog("OAuth successful! Token obtained.");
 
-    /* Fetch user info to set g_uid and g_irc_username */
     json_val *user_j = twitch_api_get("https://api.twitch.tv/helix/users", NULL);
     if (user_j) {
         json_val *data = json_obj_get(user_j, "data");
         if (data && data->type == JSON_ARR && data->arr.len > 0) {
             json_val *u = json_arr_get(data, 0);
             json_val *v = json_obj_get(u, "id");
-            if (v && v->type == JSON_STR) strncpy(g_uid, v->str, MAX_STR-1);
+            if (v && v->type == JSON_STR) safe_strcpy(g_uid, sizeof(g_uid), v->str);
             v = json_obj_get(u, "login");
-            if (v && v->type == JSON_STR) strncpy(g_irc_username, v->str, MAX_STR-1);
+            if (v && v->type == JSON_STR) safe_strcpy(g_irc_username, sizeof(g_irc_username), v->str);
         }
         json_free(user_j);
     }
@@ -1201,7 +1203,6 @@ static int cmp_stream(const void *a, const void *b) {
 static void fetch_streams(void) {
     if (g_followed_len == 0) return;
 
-    /* Build URL with all IDs (pointer advance instead of strncat) */
     char url[8192] = "https://api.twitch.tv/helix/streams?";
     char *p = url + strlen(url);
     const char *url_end = url + sizeof(url) - 1;
@@ -1216,7 +1217,7 @@ static void fetch_streams(void) {
         first = 0;
     }
 
-    if (first) return; /* no IDs */
+    if (first) return;
 
     json_val *j = twitch_api_get(url, NULL);
     if (!j) return;
@@ -1224,7 +1225,6 @@ static void fetch_streams(void) {
     json_val *data = json_obj_get(j, "data");
     if (!data || data->type != JSON_ARR) { json_free(j); return; }
 
-    /* Collect online users */
     stream_info online[64];
     int online_len = 0;
 
@@ -1235,14 +1235,13 @@ static void fetch_streams(void) {
         const char *lg = id2lg_find(uidv->str);
         if (!lg) continue;
 
-        /* Check for duplicates */
         int dup = 0;
         for (int d = 0; d < online_len; d++) {
             if (strcmp(online[d].lg, lg) == 0) { dup = 1; break; }
         }
         if (dup) continue;
 
-        strncpy(online[online_len].lg, lg, MAX_STR-1);
+        safe_strcpy(online[online_len].lg, sizeof(online[0].lg), lg);
         json_val *vv = json_obj_get(s, "viewer_count");
         online[online_len].viewers = (vv && vv->type == JSON_NUM) ? (int)vv->num : 0;
 
@@ -1255,11 +1254,11 @@ static void fetch_streams(void) {
         } else online[online_len].started = 0;
 
         json_val *tv = json_obj_get(s, "title");
-        if (tv && tv->type == JSON_STR) strncpy(online[online_len].title, tv->str, 255);
+        if (tv && tv->type == JSON_STR) safe_strcpy(online[online_len].title, sizeof(online[0].title), tv->str);
         else online[online_len].title[0] = '\0';
 
         json_val *gv = json_obj_get(s, "game_name");
-        if (gv && gv->type == JSON_STR) strncpy(online[online_len].game, gv->str, 255);
+        if (gv && gv->type == JSON_STR) safe_strcpy(online[online_len].game, sizeof(online[0].game), gv->str);
         else online[online_len].game[0] = '\0';
 
         online_len++;
@@ -1269,7 +1268,6 @@ static void fetch_streams(void) {
 
     if (online_len > MAX_TWITCH_KEYS) online_len = MAX_TWITCH_KEYS;
 
-    /* Update state */
     pthread_mutex_lock(&g_state_mu);
     g_tw_order_len = 0;
     memset(g_tw_order, 0, sizeof(g_tw_order));
@@ -1288,8 +1286,8 @@ static void fetch_streams(void) {
         g_tw_order_len = i+1;
         g_views[idx] = online[i].viewers;
         g_started_at[idx] = online[i].started;
-        strncpy(g_titles[idx], online[i].title, 255);
-        strncpy(g_categories[idx], online[i].game, 255);
+        safe_strcpy(g_titles[idx], sizeof(g_titles[0]), online[i].title);
+        safe_strcpy(g_categories[idx], sizeof(g_categories[0]), online[i].game);
         g_title_w[idx] = (float)measure_text(online[i].title, 14);
         int tlen = (int)strlen(online[i].title);
         g_title_step[idx] = (g_title_w[idx] / fmaxf(2.0f, fminf(8.0f, (float)tlen * 0.2f + 1.5f))) * SCROLL_IV;
@@ -1299,7 +1297,6 @@ static void fetch_streams(void) {
         current_online[idx] = true;
     }
 
-    /* Notifications */
     for (int i = 0; i < g_followed_len && i < MAX_FOLLOWS; i++) {
         if (current_online[i] && !g_prev_online[i]) {
             infoLog("%s started streaming!", g_followed[i]);
@@ -1391,7 +1388,6 @@ static void init_follows(void) {
         return;
     }
 
-    /* API fetch */
     if (g_uid[0] && g_config.access_token[0]) {
         char url[4096];
         snprintf(url, sizeof(url),
@@ -1417,7 +1413,6 @@ static void init_follows(void) {
         }
     }
 
-    /* Fallback defaults */
     if (g_followed_len == 0) {
         char *defaults[] = {"hanjoudesu", "bijusan", "oniyadayo", "dmf_kyochan",
             "vodkavdk", "lazvell", "ade3_3", "goroujp", "batora324",
@@ -1487,25 +1482,21 @@ static void main_loop(void) {
         time_t now = time(NULL);
         bool force_render = false;
 
-        /* Fetch streams every FETCH_IV */
         if (difftime(now, last_fetch) >= FETCH_IV) {
             last_fetch = now;
             fetch_streams();
             force_render = true;
         }
 
-        /* Scroll & render only when changed */
         bool scrolled = scroll_all();
         if ((scrolled || force_render) && g_page == PAGE_TW) render_tw();
 
-        /* Idle timeout */
         if (g_page != PAGE_TW && g_page != PAGE_LV &&
             g_page != PAGE_TX && g_page != PAGE_NX &&
             difftime(now, g_last_input) >= IDLE_TIMEOUT) {
             page_show(PAGE_TW, "", false);
         }
 
-        /* Read device input */
         if (g_dev) {
             int ret = device_read_input(g_dev, input_buf, sizeof(input_buf));
             if (ret >= 4 && input_buf[0] == 0x01) {
@@ -1519,8 +1510,7 @@ static void main_loop(void) {
             }
         }
 
-        struct timespec ts = {0, 16000000};
-        nanosleep(&ts, NULL);
+        usleep(16000);
     }
 }
 
@@ -1559,17 +1549,16 @@ int main(int argc, char **argv) {
         config_save(&g_config);
     }
 
-    strncpy(g_cid, g_config.client_id, MAX_STR-1);
-    strncpy(g_cs, g_config.client_secret, MAX_STR-1);
-    strncpy(g_at, g_config.access_token, MAX_STR-1);
-    strncpy(g_rt, g_config.refresh_token, MAX_STR-1);
-    strncpy(g_uid, g_config.user_id, MAX_STR-1);
+    safe_strcpy(g_cid, sizeof(g_cid), g_config.client_id);
+    safe_strcpy(g_cs, sizeof(g_cs), g_config.client_secret);
+    safe_strcpy(g_at, sizeof(g_at), g_config.access_token);
+    safe_strcpy(g_rt, sizeof(g_rt), g_config.refresh_token);
+    safe_strcpy(g_uid, sizeof(g_uid), g_config.user_id);
 
     char cid_hdr[2048];
     snprintf(cid_hdr, sizeof(cid_hdr), "Client-ID: %s", g_config.client_id);
     http_set_extra_header(cid_hdr);
 
-    /* Init font */
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     const char *font_paths[] = {
@@ -1590,7 +1579,6 @@ int main(int argc, char **argv) {
     }
     if (!font_ok) warnLog("No usable font found. Text will be blank.");
 
-    /* Open device */
     g_dev = device_open();
     if (!g_dev) {
         warnLog("no Stream Deck device found, exiting");
@@ -1599,7 +1587,6 @@ int main(int argc, char **argv) {
     }
 
     device_set_brightness(g_dev, g_brightness);
-    /* Init state */
     g_last_input = time(NULL);
 
     if (g_at[0] == '\0') {
@@ -1611,7 +1598,6 @@ int main(int argc, char **argv) {
         page_show(PAGE_TW, "", false);
     }
 
-    /* Start IRC thread */
     pthread_t irc_tid;
     pthread_create(&irc_tid, NULL, irc_thread, NULL);
     pthread_detach(irc_tid);
@@ -1622,7 +1608,6 @@ int main(int argc, char **argv) {
 
     device_close(g_dev);
     http_close_all();
-    curl_global_cleanup();
     log_close();
     return 0;
 }
