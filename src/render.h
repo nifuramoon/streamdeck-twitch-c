@@ -25,7 +25,8 @@ void render_text(image *img, const char *text, int x, int y,
                  uint8_t r, uint8_t g, uint8_t b);
 
 int  font_init(const char *path);
-void font_draw(image *img, const char *text, int x, int y, uint8_t r, uint8_t g, uint8_t b, float size);
+void font_draw(image *img, const char *text, int x, int y,
+               uint8_t r, uint8_t g, uint8_t b, float size);
 int  font_measure(const char *text, float size);
 int  image_save_png(image *img, const char *path);
 

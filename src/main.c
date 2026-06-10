@@ -71,7 +71,8 @@ static device *g_dev = NULL;
 static enum page g_page = PAGE_HOME;
 static char g_live[MAX_STR] = {0};
 static int g_brightness = 50;
-static bool g_debug_mode = true;
+extern bool debug_mode;
+#define g_debug_mode debug_mode
 
 typedef struct { enum page pg; char ctx[MAX_STR]; } stack_entry;
 static stack_entry g_stack[MAX_STACK];

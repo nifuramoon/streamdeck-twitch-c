@@ -8,7 +8,7 @@ typedef struct {
     char login[MAX_STR];
     char display_name[MAX_STR];
     char description[MAX_STR];
-    int  viewer_count;
+    int  viewer_count;      /* 互換性維持: stream情報混在 */
     bool is_live;
     char game_name[MAX_STR];
     char title[MAX_STR];

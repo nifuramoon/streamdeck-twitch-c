@@ -4,6 +4,8 @@
 #include <stdarg.h>
 #include <time.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define LOG_DIR "/.cache/streamdeck-twitch/logs/"
 #define LOG_FILE "latest.log"
@@ -20,46 +22,66 @@ static const char *level_str[] = {
     [LOG_ERROR] = "ERROR"
 };
 
-static void ensure_dir(const char *path) {
-    char tmp[1024];
-    snprintf(tmp, sizeof(tmp), "mkdir -p %s", path);
-    system(tmp);
+static int ensure_dir(const char *path) {
+    if (mkdir(path, 0755) != 0 && errno != EEXIST)
+        return -1;
+    return 0;
 }
 
 void log_init(void) {
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
-    snprintf(log_path, sizeof(log_path), "%s%s", home, LOG_DIR);
-    ensure_dir(log_path);
+
+    int n = snprintf(log_path, sizeof(log_path), "%s%s", home, LOG_DIR);
+    if (n < 0 || (size_t)n >= sizeof(log_path)) {
+        log_path[0] = '\0';
+        return;
+    }
+
+    if (ensure_dir(log_path) < 0) {
+        log_path[0] = '\0';
+        return;
+    }
+
     char full[1024];
-    snprintf(full, sizeof(full), "%s%s", log_path, LOG_FILE);
+    n = snprintf(full, sizeof(full), "%s%s", log_path, LOG_FILE);
+    if (n < 0 || (size_t)n >= sizeof(full)) return;
+
     log_fp = fopen(full, "a");
+    if (!log_fp) log_path[0] = '\0';
 }
 
 void log_close(void) {
-    if (log_fp) fclose(log_fp);
+    if (log_fp) {
+        fclose(log_fp);
+        log_fp = NULL;
+    }
 }
 
 void log_write(enum log_level lvl, const char *fmt, ...) {
     time_t t = time(NULL);
-    struct tm *lt = localtime(&t);
+    struct tm lt;
+    localtime_r(&t, &lt);
     char ts[64];
-    strftime(ts, sizeof(ts), "%H:%M:%S", lt);
+    strftime(ts, sizeof(ts), "%H:%M:%S", &lt);
 
-    fprintf(stderr, "[%s][%s] ", ts, level_str[lvl]);
+    const char *lv = level_str[lvl];
 
-    va_list ap;
+    va_list ap, ap2;
     va_start(ap, fmt);
+    va_copy(ap2, ap);
+
+    fprintf(stderr, "[%s][%s] ", ts, lv);
     vfprintf(stderr, fmt, ap);
-    va_end(ap);
     fprintf(stderr, "\n");
 
     if (log_fp) {
-        fprintf(log_fp, "[%s][%s] ", ts, level_str[lvl]);
-        va_start(ap, fmt);
-        vfprintf(log_fp, fmt, ap);
-        va_end(ap);
+        fprintf(log_fp, "[%s][%s] ", ts, lv);
+        vfprintf(log_fp, fmt, ap2);
         fprintf(log_fp, "\n");
         fflush(log_fp);
     }
+
+    va_end(ap);
+    va_end(ap2);
 }
