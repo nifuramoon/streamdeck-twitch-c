@@ -45,7 +45,8 @@ extern char **environ;
 #define MAX_YT_KEYS 14
 #define SCROLL_IV 0.033f
 #define FETCH_IV 3
-#define YT_FETCH_IV 30
+#define YT_FETCH_IV 900
+#define YT_VIEWER_IV 60
 #define IDLE_TIMEOUT 60.0
 #define W 72
 #define H 72
@@ -128,6 +129,7 @@ static float g_yt_title_step[MAX_YT_KEYS];
 static float g_yt_title_w[MAX_YT_KEYS];
 static char g_yt_thumbnails[MAX_YT_KEYS][MAX_STR];
 static char g_yt_ch_ids_ord[MAX_YT_KEYS][MAX_STR];
+static char g_yt_video_ids[MAX_YT_KEYS][MAX_STR];
 static int g_prev_online_len = 0;
 
 /* LRU cache for profile images */
@@ -1581,13 +1583,13 @@ static void fetch_yt_streams(void)
     if (g_yt_sub_len == 0) { fetch_yt_subs(); return; }
 
     char *ch_ids[50] = {0}, *names[50] = {0};
-    char title_buf[50][256], thumb_buf[50][MAX_STR];
+    char title_buf[50][256], thumb_buf[50][MAX_STR], vid_buf[50][MAX_STR];
     int viewers_arr[50] = {0};
     int live_count = 0;
 
     if (yt_get_trending_live(g_yt_api_key, ch_ids, names,
-                             title_buf, thumb_buf,
-                             viewers_arr, 14, &live_count, 1) < 0) {
+                             title_buf, thumb_buf, vid_buf,
+                             viewers_arr, 14, &live_count) < 0) {
         infoLog("YT trending live fetch failed");
         return;
     }
@@ -1603,6 +1605,7 @@ static void fetch_yt_streams(void)
         safe_strcpy(g_yt_ch_ids_ord[idx], sizeof(g_yt_ch_ids_ord[0]), ch_ids[i]);
         safe_strcpy(g_yt_titles[idx], sizeof(g_yt_titles[0]), title_buf[i]);
         safe_strcpy(g_yt_thumbnails[idx], sizeof(g_yt_thumbnails[0]), thumb_buf[i]);
+        safe_strcpy(g_yt_video_ids[idx], sizeof(g_yt_video_ids[0]), vid_buf[i]);
         g_yt_viewers[idx] = viewers_arr[i];
         g_yt_title_w[idx] = (float)measure_text(title_buf[i], 14);
         int tlen = (int)strlen(title_buf[i]);
@@ -1616,6 +1619,19 @@ static void fetch_yt_streams(void)
     }
 
     infoLog("YT live channels: %d", g_yt_order_len);
+}
+
+static void fetch_yt_viewers(void)
+{
+    if (!g_yt_api_key || g_yt_api_key[0] == '\0') return;
+    if (g_yt_order_len == 0) return;
+
+    int viewers[MAX_YT_KEYS] = {0};
+    if (yt_batch_viewers(g_yt_api_key, g_yt_video_ids, g_yt_order_len, viewers) < 0)
+        return;
+
+    for (int i = 0; i < g_yt_order_len; i++)
+        g_yt_viewers[i] = viewers[i];
 }
 
 /* ================================================================
@@ -1737,6 +1753,11 @@ static void main_loop(void) {
             last_yt_fetch = now;
             fetch_yt_streams();
             force_render = true;
+        }
+        static time_t last_yt_vfetch = 0;
+        if (difftime(now, last_yt_vfetch) >= YT_VIEWER_IV) {
+            last_yt_vfetch = now;
+            fetch_yt_viewers();
         }
 
         bool scrolled = scroll_all();

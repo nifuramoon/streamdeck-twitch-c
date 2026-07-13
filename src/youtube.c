@@ -149,10 +149,11 @@ int yt_load_subs_cache(char *channel_ids[], char *names[], int max, int *out_len
     return 0;
 }
 
-/* 一括 search でライブ配信を取得。各チャンネル1回のAPIコールに抑える */
+/* 一括 search でライブ配信を取得。1回のAPIコール */
 int yt_get_trending_live(const char *api_key, char *channel_ids[], char *names[],
-                         char titles[][256], char thumbs[][MAX_STR], int *viewers,
-                         int max, int *out_len, int max_requests)
+                         char titles[][256], char thumbs[][MAX_STR],
+                         char video_ids[][MAX_STR], int *viewers,
+                         int max, int *out_len)
 {
     char url[8192];
     snprintf(url, sizeof(url),
@@ -193,8 +194,62 @@ int yt_get_trending_live(const char *api_key, char *channel_ids[], char *names[]
             if (med) json_strcpy(thumbs[idx], MAX_STR, json_obj_get(med, "url"));
         }
 
+        json_val *id_obj = json_obj_get(item, "id");
+        video_ids[idx][0] = '\0';
+        if (id_obj) json_strcpy(video_ids[idx], MAX_STR, json_obj_get(id_obj, "videoId"));
+
         viewers[idx] = 0;
         (*out_len)++;
+    }
+
+    json_free(j);
+    return 0;
+}
+
+int yt_batch_viewers(const char *api_key, char video_ids[][MAX_STR], int count,
+                     int *viewers_out)
+{
+    if (count <= 0) return -1;
+
+    char id_list[8192] = {0};
+    char *p = id_list;
+    const char *end = id_list + sizeof(id_list) - 1;
+    for (int i = 0; i < count; i++) {
+        if (!video_ids[i][0]) continue;
+        int n = snprintf(p, (size_t)(end - p), "%s%s",
+                         (p == id_list) ? "" : ",", video_ids[i]);
+        if (n <= 0 || p + n >= end) break;
+        p += n;
+    }
+
+    if (id_list[0] == '\0') return -1;
+
+    char url[16384];
+    snprintf(url, sizeof(url),
+             "%s/videos?part=liveStreamingDetails&id=%s&key=%s",
+             YT_API_BASE, id_list, api_key);
+
+    http_resp *r = http_get(url, NULL);
+    if (!r || r->status != 200) {
+        http_resp_free(r);
+        return -1;
+    }
+
+    json_val *j = json_parse(r->body);
+    http_resp_free(r);
+    if (!j) return -1;
+
+    json_val *items = json_obj_get(j, "items");
+    if (!items || items->type != JSON_ARR) { json_free(j); return -1; }
+
+    for (size_t i = 0; i < items->arr.len && i < (size_t)count; i++) {
+        json_val *item = json_arr_get(items, i);
+        json_val *lsd = json_obj_get(item, "liveStreamingDetails");
+        if (!lsd) continue;
+
+        json_val *cc = json_obj_get(lsd, "concurrentViewers");
+        if (cc && cc->type == JSON_STR)
+            viewers_out[i] = atoi(cc->str);
     }
 
     json_free(j);
