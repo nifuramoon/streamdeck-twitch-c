@@ -9,6 +9,7 @@
 #include "render.h"
 #include "auto_fix.h"
 #include "twitch.h"
+#include "youtube.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,8 +42,10 @@ extern char **environ;
  * ================================================================ */
 #define MAX_KEYS 15
 #define MAX_TWITCH_KEYS 14
+#define MAX_YT_KEYS 14
 #define SCROLL_IV 0.033f
 #define FETCH_IV 3
+#define YT_FETCH_IV 30
 #define IDLE_TIMEOUT 60.0
 #define W 72
 #define H 72
@@ -59,7 +62,8 @@ extern char **environ;
  * ================================================================ */
 enum page {
     PAGE_HOME, PAGE_TW, PAGE_LV, PAGE_TX, PAGE_NX,
-    PAGE_ST, PAGE_SD, PAGE_OA, PAGE_FN, PAGE_UI
+    PAGE_ST, PAGE_SD, PAGE_OA, PAGE_FN, PAGE_UI,
+    PAGE_YT
 };
 
 /* ================================================================
@@ -106,6 +110,24 @@ static double g_started_at[MAX_FOLLOWS];
 static enum scroll_mode g_scroll_mode = SCROLL_TITLE;
 static int g_last_online_count = 0;
 static bool g_prev_online[MAX_FOLLOWS];
+
+/* Youtube state */
+#define MAX_YT_SUBS 200
+static char *g_yt_ch_ids[MAX_YT_SUBS];
+static char *g_yt_ch_names[MAX_YT_SUBS];
+static int g_yt_sub_len = 0;
+
+static char *g_yt_order[MAX_YT_KEYS];
+static int g_yt_order_len = 0;
+static int g_yt_viewers[MAX_YT_KEYS];
+static char g_yt_titles[MAX_YT_KEYS][256];
+static float g_yt_title_ofs[MAX_YT_KEYS];
+static float g_yt_title_w[MAX_YT_KEYS];
+static float g_yt_title_step[MAX_YT_KEYS];
+static float g_yt_title_step[MAX_YT_KEYS];
+static float g_yt_title_w[MAX_YT_KEYS];
+static char g_yt_thumbnails[MAX_YT_KEYS][MAX_STR];
+static char g_yt_ch_ids_ord[MAX_YT_KEYS][MAX_STR];
 static int g_prev_online_len = 0;
 
 /* LRU cache for profile images */
@@ -437,6 +459,8 @@ static void platform_speak_text(const char *text) {
     posix_spawnp(&pid, "espeak-ng", NULL, NULL, argv, environ);
 }
 
+static const char *g_yt_api_key = NULL;
+
 static json_val *twitch_api_call(const char *url) {
     http_resp *r = http_get(url, g_config.access_token);
     if (!r) { errorLog("twitch_api_call: http_get returned NULL"); return NULL; }
@@ -608,8 +632,49 @@ static image *tw_img(const char *prof_url, const char *login) {
     return img;
 }
 
+static image *yt_img(const char *thumb_url, const char *name, int idx, int viewers)
+{
+    image *img = image_pool_get();
+    render_fill(img, 30, 30, 30);
+
+    image *prof = NULL;
+    if (thumb_url && thumb_url[0])
+        prof = fetch_prof(thumb_url);
+
+    if (prof) {
+        for (int y = 0; y < 72; y++) {
+            memcpy(img->data + y * 288, prof->data + y * 288, 288);
+        }
+        for (int y = 0; y < 72; y++) {
+            uint8_t *row = img->data + y * 288;
+            for (int x = 0; x < 72; x++) row[x*4+3] = 255;
+        }
+    } else {
+        draw_text(img, 4, 25, name, 255, 255, 255, 12);
+    }
+
+    if (idx < 0 || idx >= g_yt_order_len) return img;
+
+    if (viewers > 0) {
+        const char *s = viewer_count_str(viewers);
+        render_rect(img, 1, 1, 45, 14, 0, 0, 0);
+        font_draw(img, s, 3, 1, 255, 255, 255, 10);
+    }
+
+    char txt[256] = {0};
+    safe_strcpy(txt, sizeof(txt), g_yt_titles[idx]);
+
+    if (txt[0]) {
+        render_rect(img, 0, 72-21, 72, 21, 0, 0, 0);
+        draw_scroll_text(img, 72-21, txt, g_yt_title_ofs[idx], 255, 217, 0, (int)g_yt_title_w[idx]);
+    }
+
+    return img;
+}
+
 static void render_home(void) {
     if (!g_dev) return;
+    device_clear_all(g_dev);
     image *img;
     img = key_text_bg("Twitch", 100, 0, 255);
     int r = device_set_key(g_dev, 0, img->data, (size_t)72*72*4); if (r < 0) errorLog("set_key 0 failed"); image_free(img);
@@ -617,7 +682,9 @@ static void render_home(void) {
     r = device_set_key(g_dev, 1, img->data, (size_t)72*72*4); if (r < 0) errorLog("set_key 1 failed"); image_free(img);
     img = key_text_bg("Setting", 40, 40, 40);
     r = device_set_key(g_dev, 2, img->data, (size_t)72*72*4); if (r < 0) errorLog("set_key 2 failed"); image_free(img);
-    for (int i = 3; i < MAX_KEYS; i++) {
+    img = key_text_bg("Youtube", 255, 0, 0);
+    r = device_set_key(g_dev, 3, img->data, (size_t)72*72*4); if (r < 0) errorLog("set_key 3 failed"); image_free(img);
+    for (int i = 4; i < MAX_KEYS; i++) {
         img = key_text_bg("", 0, 0, 0);
         r = device_set_key(g_dev, i, img->data, (size_t)72*72*4); if (r < 0) errorLog("set_key %d failed", i); image_free(img);
     }
@@ -625,14 +692,23 @@ static void render_home(void) {
 
 static void render_tw(void) {
     if (!g_dev) return;
-    static unsigned char prev_sha[MAX_KEYS][20] = {{0}};
+
+    pthread_mutex_lock(&g_state_mu);
+    int order_len = g_tw_order_len;
+    char *tw_snapshot[MAX_TWITCH_KEYS] = {0};
+    for (int i = 0; i < order_len; i++)
+        tw_snapshot[i] = g_tw_order[i];
+    pthread_mutex_unlock(&g_state_mu);
+
+    if (order_len == 0) return;
+
     static int frame = 0;
     frame++;
     int capture = g_debug_mode && (frame % 30 == 0) ? 1 : 0;
     for (int i = 0; i < MAX_TWITCH_KEYS; i++) {
         image *img;
-        if (i < g_tw_order_len && g_tw_order[i]) {
-            char *lg = g_tw_order[i];
+        if (i < order_len && tw_snapshot[i]) {
+            char *lg = tw_snapshot[i];
             json_val *u = lu_get(lg);
             if (u) {
                 json_val *purl = json_obj_get(u, "profile_image_url");
@@ -644,21 +720,7 @@ static void render_tw(void) {
         } else {
             img = key_text_bg("", 0, 0, 0);
         }
-        uint8_t *d = img->data;
-        unsigned char h[20] = {0};
-        __m128i x0 = _mm_setzero_si128(), x1 = _mm_setzero_si128();
-        for (int j = 0; j < 72*72*4; j += 32) {
-            __m128i v0 = _mm_loadu_si128((__m128i*)(d + j));
-            __m128i v1 = _mm_loadu_si128((__m128i*)(d + j + 16));
-            x0 = _mm_xor_si128(x0, v0);
-            x1 = _mm_xor_si128(x1, v1);
-        }
-        _mm_storeu_si128((__m128i*)h, _mm_xor_si128(x0, x1));
-        h[16] = d[0] ^ d[1]; h[17] = d[2] ^ d[3]; h[18] = d[4]; h[19] = d[5];
-        if (memcmp(h, prev_sha[i], 20) != 0) {
-            memcpy(prev_sha[i], h, 20);
-            device_set_key(g_dev, i, d, (size_t)72*72*4);
-        }
+        device_set_key(g_dev, i, img->data, (size_t)72*72*4);
         if (capture) {
             char pname[80];
             snprintf(pname, sizeof(pname), "/tmp/streamdeck/btn%d.png", i);
@@ -667,31 +729,41 @@ static void render_tw(void) {
         image_free(img);
     }
     image *img = key_text_bg("ホーム", 50, 0, 50);
-    uint8_t *d = img->data;
-    unsigned char h[20] = {0};
-    __m128i x0 = _mm_setzero_si128(), x1 = _mm_setzero_si128();
-    for (int j = 0; j < 72*72*4; j += 32) {
-        __m128i v0 = _mm_loadu_si128((__m128i*)(d + j));
-        __m128i v1 = _mm_loadu_si128((__m128i*)(d + j + 16));
-        x0 = _mm_xor_si128(x0, v0);
-        x1 = _mm_xor_si128(x1, v1);
-    }
-    _mm_storeu_si128((__m128i*)h, _mm_xor_si128(x0, x1));
-    h[16] = d[0] ^ d[1]; h[17] = d[2] ^ d[3]; h[18] = d[4]; h[19] = d[5];
-    if (memcmp(h, prev_sha[14], 20) != 0) {
-        memcpy(prev_sha[14], h, 20);
-        device_set_key(g_dev, 14, d, (size_t)72*72*4);
-    }
+    device_set_key(g_dev, 14, img->data, (size_t)72*72*4);
     if (capture) {
-        char pname[80];
-        snprintf(pname, sizeof(pname), "/tmp/streamdeck/btn14.png");
-        image_save_png(img, pname);
+        image_save_png(img, "/tmp/streamdeck/btn14.png");
     }
     image_free(img);
 }
 
+static void render_yt(void) {
+    if (!g_dev) return;
+    device_clear_all(g_dev);
+    static int frame = 0;
+    frame++;
+    int capture = g_debug_mode && (frame % 30 == 0) ? 1 : 0;
+    for (int i = 0; i < MAX_YT_KEYS; i++) {
+        image *img;
+        if (i < g_yt_order_len) {
+            img = yt_img(g_yt_thumbnails[i], g_yt_order[i], i, g_yt_viewers[i]);
+        } else {
+            img = key_text_bg("", 0, 0, 0);
+        }
+        device_set_key(g_dev, i, img->data, (size_t)72*72*4);
+        if (capture) {
+            char pname[80];
+            snprintf(pname, sizeof(pname), "/tmp/streamdeck/ytbtn%d.png", i);
+            image_save_png(img, pname);
+        }
+        image_free(img);
+    }
+    image *img = key_text_bg("ホーム", 50, 0, 50);
+    device_set_key(g_dev, 14, img->data, (size_t)72*72*4);
+    image_free(img);
+}
+
 static void render_lv(const char *lg) {
-    (void)lg; if (!g_dev) return;
+    (void)lg; if (!g_dev) return; device_clear_all(g_dev);
     for (int i = 0; i < MAX_KEYS; i++) {
         image *img = key_text_bg("", 0, 0, 0);
         device_set_key(g_dev, i, img->data, (size_t)72*72*4); image_free(img);
@@ -712,7 +784,7 @@ static void render_lv(const char *lg) {
 }
 
 static void render_tx(void) {
-    if (!g_dev) return;
+    if (!g_dev) return; device_clear_all(g_dev);
     for (int i = 0; i < MAX_KEYS; i++) {
         image *img = key_text_bg("", 0, 0, 0);
         device_set_key(g_dev, i, img->data, (size_t)72*72*4); image_free(img);
@@ -731,7 +803,7 @@ static void render_tx(void) {
 }
 
 static void render_nx(void) {
-    if (!g_dev) return;
+    if (!g_dev) return; device_clear_all(g_dev);
     for (int i = 0; i < MAX_KEYS; i++) {
         image *img = key_text_bg("", 0, 0, 0);
         device_set_key(g_dev, i, img->data, (size_t)72*72*4); image_free(img);
@@ -747,7 +819,7 @@ static void render_nx(void) {
 }
 
 static void render_st(void) {
-    if (!g_dev) return;
+    if (!g_dev) return; device_clear_all(g_dev);
     for (int i = 0; i < MAX_KEYS; i++) {
         image *img = key_text_bg("", 0, 0, 0);
         device_set_key(g_dev, i, img->data, (size_t)72*72*4); image_free(img);
@@ -768,7 +840,7 @@ static void render_st(void) {
 }
 
 static void render_sd(void) {
-    if (!g_dev) return;
+    if (!g_dev) return; device_clear_all(g_dev);
     for (int i = 0; i < MAX_KEYS; i++) {
         image *img = key_text_bg("", 0, 0, 0);
         device_set_key(g_dev, i, img->data, (size_t)72*72*4); image_free(img);
@@ -785,19 +857,21 @@ static void render_sd(void) {
 }
 
 static void render_oa(void) {
-    if (!g_dev) return;
+    if (!g_dev) return; device_clear_all(g_dev);
     for (int i = 0; i < MAX_KEYS; i++) {
         image *img = key_text_bg("", 0, 0, 0);
         device_set_key(g_dev, i, img->data, (size_t)72*72*4); image_free(img);
     }
-    image *img = key_text_bg("Auth", 0, 100, 200);
+    image *img = key_text_bg("TwAuth", 0, 100, 200);
     device_set_key(g_dev, 0, img->data, (size_t)72*72*4); image_free(img);
+    img = key_text_bg("YTAuth", 255, 0, 0);
+    device_set_key(g_dev, 1, img->data, (size_t)72*72*4); image_free(img);
     img = key_text_bg("Back", 40, 40, 0);
     device_set_key(g_dev, 14, img->data, (size_t)72*72*4); image_free(img);
 }
 
 static void render_fn(void) {
-    if (!g_dev) return;
+    if (!g_dev) return; device_clear_all(g_dev);
     for (int i = 0; i < MAX_KEYS; i++) {
         image *img = key_text_bg("", 0, 0, 0);
         device_set_key(g_dev, i, img->data, (size_t)72*72*4); image_free(img);
@@ -815,7 +889,7 @@ static void render_fn(void) {
 }
 
 static void render_ui(void) {
-    if (!g_dev) return;
+    if (!g_dev) return; device_clear_all(g_dev);
     for (int i = 0; i < MAX_KEYS; i++) {
         image *img = key_text_bg("", 0, 0, 0);
         device_set_key(g_dev, i, img->data, (size_t)72*72*4); image_free(img);
@@ -975,8 +1049,6 @@ static void page_show(enum page pg, const char *ctx, bool push) {
     if (ctx) safe_strcpy(g_live, sizeof(g_live), ctx);
     else g_live[0] = '\0';
 
-    if (g_dev) device_reset_cache(g_dev);
-
     switch (pg) {
         case PAGE_HOME: render_home(); break;
         case PAGE_TW:   render_tw(); break;
@@ -988,6 +1060,7 @@ static void page_show(enum page pg, const char *ctx, bool push) {
         case PAGE_OA:   render_oa(); break;
         case PAGE_FN:   render_fn(); break;
         case PAGE_UI:   render_ui(); break;
+        case PAGE_YT:   render_yt(); break;
     }
 }
 
@@ -1014,6 +1087,7 @@ static void handle_home(int k) {
         case 0: page_show(PAGE_TW, "", true); break;
         case 1: page_show(PAGE_OA, "", true); break;
         case 2: page_show(PAGE_ST, "", true); break;
+        case 3: page_show(PAGE_YT, "", true); break;
     }
 }
 
@@ -1088,10 +1162,12 @@ static void handle_sd(int k) {
 static void init_follows(void);
 static void fetch_users(char **logins, int len);
 static void start_oauth(void);
+static void start_yt_oauth(void);
 
 static void handle_oa(int k) {
     if (handle_nav(k, false, true)) return;
     if (k == 0) start_oauth();
+    if (k == 1) start_yt_oauth();
 }
 
 static void start_oauth(void) {
@@ -1160,6 +1236,110 @@ static void start_oauth(void) {
     }
 }
 
+static void fetch_yt_subs(void)
+{
+    if (!g_config.yt_client_id[0] || !g_config.yt_access_token[0]) return;
+
+    if (g_yt_sub_len > 0) return;
+
+    if (yt_load_subs_cache(g_yt_ch_ids, g_yt_ch_names, MAX_YT_SUBS, &g_yt_sub_len) == 0) {
+        infoLog("YT subs loaded from cache: %d", g_yt_sub_len);
+        return;
+    }
+
+    if (yt_fetch_subs(g_config.yt_access_token, g_yt_ch_ids, g_yt_ch_names,
+                      MAX_YT_SUBS, &g_yt_sub_len) == 0) {
+        infoLog("YT subs fetched: %d", g_yt_sub_len);
+    }
+}
+
+static void start_yt_oauth(void) {
+    if (g_config.yt_client_id[0] == '\0') {
+        warnLog("YT Client ID not set.");
+        return;
+    }
+
+    if (oauth_start_server() < 0) {
+        errorLog("YT OAuth: %s", oauth_get_error());
+        return;
+    }
+
+    char url[4096];
+    snprintf(url, sizeof(url),
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        "?client_id=%s"
+        "&redirect_uri=http://localhost:8080"
+        "&response_type=code"
+        "&scope=https://www.googleapis.com/auth/youtube.readonly"
+        "&access_type=offline"
+        "&prompt=consent",
+        g_config.yt_client_id);
+
+    pid_t pid;
+    char *argv[] = {"xdg-open", url, NULL};
+    posix_spawnp(&pid, "xdg-open", NULL, NULL, argv, environ);
+
+    infoLog("Waiting for YT OAuth callback...");
+
+    if (oauth_wait_for_result(120) < 0) {
+        errorLog("YT OAuth: %s", oauth_get_error());
+        oauth_stop_server();
+        return;
+    }
+
+    const char *code = oauth_get_code();
+    oauth_stop_server();
+
+    char body[4096];
+    snprintf(body, sizeof(body),
+        "code=%s"
+        "&client_id=%s"
+        "&client_secret=%s"
+        "&redirect_uri=http://localhost:8080"
+        "&grant_type=authorization_code",
+        code, g_config.yt_client_id, g_config.yt_client_secret);
+
+    http_resp *r = http_post_form("https://oauth2.googleapis.com/token", body, NULL);
+    if (!r || r->status != 200) {
+        errorLog("YT token exchange failed (status %d)", r ? r->status : -1);
+        http_resp_free(r);
+        return;
+    }
+
+    json_val *j = json_parse(r->body);
+    http_resp_free(r);
+    if (!j) return;
+
+    json_val *v;
+    v = json_obj_get(j, "access_token");
+    if (v && v->type == JSON_STR)
+        safe_strcpy(g_config.yt_access_token, sizeof(g_config.yt_access_token), v->str);
+
+    v = json_obj_get(j, "refresh_token");
+    if (v && v->type == JSON_STR)
+        safe_strcpy(g_config.yt_refresh_token, sizeof(g_config.yt_refresh_token), v->str);
+
+    json_free(j);
+    config_save(&g_config);
+
+    infoLog("YT OAuth successful!");
+
+    g_yt_sub_len = 0;
+    fetch_yt_subs();
+
+    if (g_page == PAGE_OA)
+        page_show(PAGE_YT, "", true);
+}
+
+static void handle_yt(int k) {
+    if (handle_nav(k, false, true)) return;
+    if (k < g_yt_order_len && g_yt_ch_ids_ord[k][0]) {
+        char url[512];
+        snprintf(url, sizeof(url), "https://www.youtube.com/channel/%s/live", g_yt_ch_ids_ord[k]);
+        platform_open_browser(url);
+    }
+}
+
 static void handle_fn(int k) {
     if (handle_nav(k, true, true)) return;
     if (k >= 0 && k < 5) page_show(PAGE_HOME, "", false);
@@ -1184,6 +1364,7 @@ static void on_key(int k) {
         case PAGE_OA:   handle_oa(k); break;
         case PAGE_FN:   handle_fn(k); break;
         case PAGE_UI:   handle_ui(k); break;
+        case PAGE_YT:   handle_yt(k); break;
     }
 }
 
@@ -1283,7 +1464,6 @@ static void fetch_streams(void) {
         if (idx < 0) continue;
 
         g_tw_order[i] = g_followed[idx];
-        g_tw_order_len = i+1;
         g_views[idx] = online[i].viewers;
         g_started_at[idx] = online[i].started;
         safe_strcpy(g_titles[idx], sizeof(g_titles[0]), online[i].title);
@@ -1296,6 +1476,7 @@ static void fetch_streams(void) {
         g_cat_step[idx] = (g_cat_w[idx] / fmaxf(2.0f, fminf(8.0f, (float)clen * 0.2f + 1.5f))) * SCROLL_IV;
         current_online[idx] = true;
     }
+    g_tw_order_len = online_len;
 
     for (int i = 0; i < g_followed_len && i < MAX_FOLLOWS; i++) {
         if (current_online[i] && !g_prev_online[i]) {
@@ -1315,6 +1496,19 @@ static void fetch_streams(void) {
     }
     pthread_mutex_unlock(&g_state_mu);
     json_free(j);
+}
+
+static bool scroll_yt_titles(void) {
+    bool changed = false;
+    for (int i = 0; i < g_yt_order_len; i++) {
+        float prev = g_yt_title_ofs[i];
+        g_yt_title_ofs[i] += g_yt_title_step[i];
+        if (g_yt_title_w[i] > 0 &&
+            fmodf(g_yt_title_ofs[i], g_yt_title_w[i]) >= g_yt_title_w[i])
+            g_yt_title_ofs[i] = 0;
+        if (g_yt_title_ofs[i] != prev) changed = true;
+    }
+    return changed;
 }
 
 static bool scroll_all(void) {
@@ -1371,6 +1565,57 @@ static bool scroll_all(void) {
 
     pthread_mutex_unlock(&g_state_mu);
     return changed;
+}
+
+static int is_subscribed(const char *ch_id)
+{
+    for (int i = 0; i < g_yt_sub_len; i++)
+        if (g_yt_ch_ids[i] && strcmp(g_yt_ch_ids[i], ch_id) == 0)
+            return i;
+    return -1;
+}
+
+static void fetch_yt_streams(void)
+{
+    if (!g_yt_api_key || g_yt_api_key[0] == '\0') return;
+    if (g_yt_sub_len == 0) { fetch_yt_subs(); return; }
+
+    char *ch_ids[50] = {0}, *names[50] = {0};
+    char title_buf[50][256], thumb_buf[50][MAX_STR];
+    int viewers_arr[50] = {0};
+    int live_count = 0;
+
+    if (yt_get_trending_live(g_yt_api_key, ch_ids, names,
+                             title_buf, thumb_buf,
+                             viewers_arr, 14, &live_count, 1) < 0) {
+        infoLog("YT trending live fetch failed");
+        return;
+    }
+
+    g_yt_order_len = 0;
+    memset(g_yt_order, 0, sizeof(g_yt_order));
+
+    for (int i = 0; i < live_count && g_yt_order_len < MAX_YT_KEYS; i++) {
+        if (is_subscribed(ch_ids[i]) < 0) continue;
+
+        int idx = g_yt_order_len;
+        g_yt_order[idx] = names[i] ? names[i] : ch_ids[i];
+        safe_strcpy(g_yt_ch_ids_ord[idx], sizeof(g_yt_ch_ids_ord[0]), ch_ids[i]);
+        safe_strcpy(g_yt_titles[idx], sizeof(g_yt_titles[0]), title_buf[i]);
+        safe_strcpy(g_yt_thumbnails[idx], sizeof(g_yt_thumbnails[0]), thumb_buf[i]);
+        g_yt_viewers[idx] = viewers_arr[i];
+        g_yt_title_w[idx] = (float)measure_text(title_buf[i], 14);
+        int tlen = (int)strlen(title_buf[i]);
+        g_yt_title_step[idx] = (g_yt_title_w[idx] / fmaxf(2.0f, fminf(8.0f, (float)tlen * 0.2f + 1.5f))) * SCROLL_IV;
+        g_yt_title_ofs[idx] = 0;
+        g_yt_order_len++;
+    }
+
+    for (int i = 0; i < live_count; i++) {
+        free(ch_ids[i]); free(names[i]);
+    }
+
+    infoLog("YT live channels: %d", g_yt_order_len);
 }
 
 /* ================================================================
@@ -1473,6 +1718,7 @@ static void fetch_users(char **logins, int len) {
  * ================================================================ */
 static void main_loop(void) {
     time_t last_fetch = 0;
+    time_t last_yt_fetch = 0;
     uint8_t input_buf[32];
     uint8_t prev_keys[MAX_KEYS] = {0};
 
@@ -1487,9 +1733,17 @@ static void main_loop(void) {
             fetch_streams();
             force_render = true;
         }
+        if (difftime(now, last_yt_fetch) >= YT_FETCH_IV) {
+            last_yt_fetch = now;
+            fetch_yt_streams();
+            force_render = true;
+        }
 
         bool scrolled = scroll_all();
         if ((scrolled || force_render) && g_page == PAGE_TW) render_tw();
+
+        bool yt_scrolled = scroll_yt_titles();
+        if ((yt_scrolled || force_render) && g_page == PAGE_YT) render_yt();
 
         if (g_page != PAGE_TW && g_page != PAGE_LV &&
             g_page != PAGE_TX && g_page != PAGE_NX &&
@@ -1554,6 +1808,7 @@ int main(int argc, char **argv) {
     safe_strcpy(g_at, sizeof(g_at), g_config.access_token);
     safe_strcpy(g_rt, sizeof(g_rt), g_config.refresh_token);
     safe_strcpy(g_uid, sizeof(g_uid), g_config.user_id);
+    g_yt_api_key = g_config.youtube_api_key;
 
     char cid_hdr[2048];
     snprintf(cid_hdr, sizeof(cid_hdr), "Client-ID: %s", g_config.client_id);

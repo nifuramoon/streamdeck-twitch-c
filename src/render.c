@@ -116,7 +116,7 @@ int image_load(const char *path, image *img) {
     int w, h, n;
     unsigned char *data = stbi_load(path, &w, &h, &n, 4);
     if (!data) {
-        errorLog("stbi_load failed: %s", stbi_failure_reason());
+
         return -1;
     }
     if (!is_pool_image(img))

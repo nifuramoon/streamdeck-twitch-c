@@ -88,6 +88,15 @@ void device_reset_cache(device *dev) {
     memset(dev->jpg_crc, 0, sizeof(dev->jpg_crc));
 }
 
+int device_clear_all(device *dev) {
+    if (!dev) return -1;
+    static const uint8_t black[72*72*4] = {0};
+    for (int i = 0; i < 15; i++)
+        device_set_key(dev, i, black, sizeof(black));
+    device_reset_cache(dev);
+    return 0;
+}
+
 int device_set_key(device *dev, int key_idx, const uint8_t *image_data, size_t image_size) {
     (void)image_size;
     if (!dev || !dev->handle || key_idx < 0 || key_idx >= 15) return -1;

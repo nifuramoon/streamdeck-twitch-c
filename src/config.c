@@ -11,6 +11,14 @@ config g_config;
 
 /* ---------- 内部ヘルパー ---------- */
 
+static inline void safe_strcpy(char *dst, size_t size, const char *src) {
+    if (!src || size == 0) return;
+    size_t len = strlen(src);
+    if (len >= size) len = size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
 static inline void json_strcpy(char *dst, size_t size, const json_val *v)
 {
     if (v && v->type == JSON_STR) {
@@ -96,10 +104,30 @@ int config_load(config *cfg)
     v = json_obj_get(j, "refresh_token");  json_strcpy(cfg->refresh_token,  sizeof(cfg->refresh_token),  v);
     v = json_obj_get(j, "user_id");        json_strcpy(cfg->user_id,        sizeof(cfg->user_id),        v);
     v = json_obj_get(j, "channel_name");   json_strcpy(cfg->channel_name,   sizeof(cfg->channel_name),   v);
+    v = json_obj_get(j, "youtube_api_key");   json_strcpy(cfg->youtube_api_key,   sizeof(cfg->youtube_api_key),   v);
+    v = json_obj_get(j, "yt_client_id");      json_strcpy(cfg->yt_client_id,      sizeof(cfg->yt_client_id),      v);
+    v = json_obj_get(j, "yt_client_secret");  json_strcpy(cfg->yt_client_secret,  sizeof(cfg->yt_client_secret),  v);
+    v = json_obj_get(j, "yt_access_token");   json_strcpy(cfg->yt_access_token,   sizeof(cfg->yt_access_token),   v);
+    v = json_obj_get(j, "yt_refresh_token");  json_strcpy(cfg->yt_refresh_token,  sizeof(cfg->yt_refresh_token),  v);
 
     json_free(j);
     infoLog("config loaded: %s", path);
     return 0;
+}
+
+int config_set_yt_oauth(const char *client_id, const char *client_secret)
+{
+    safe_strcpy(g_config.yt_client_id, sizeof(g_config.yt_client_id), client_id);
+    safe_strcpy(g_config.yt_client_secret, sizeof(g_config.yt_client_secret), client_secret);
+    return config_save(&g_config);
+}
+
+int config_set_yt_token(const char *access_token, const char *refresh_token)
+{
+    safe_strcpy(g_config.yt_access_token, sizeof(g_config.yt_access_token), access_token);
+    if (refresh_token)
+        safe_strcpy(g_config.yt_refresh_token, sizeof(g_config.yt_refresh_token), refresh_token);
+    return config_save(&g_config);
 }
 
 int config_save(config *cfg)
@@ -129,11 +157,19 @@ int config_save(config *cfg)
         "  \"access_token\": \"%s\",\n"
         "  \"refresh_token\": \"%s\",\n"
         "  \"user_id\": \"%s\",\n"
-        "  \"channel_name\": \"%s\"\n"
+        "  \"channel_name\": \"%s\",\n"
+        "  \"youtube_api_key\": \"%s\",\n"
+        "  \"yt_client_id\": \"%s\",\n"
+        "  \"yt_client_secret\": \"%s\",\n"
+        "  \"yt_access_token\": \"%s\",\n"
+        "  \"yt_refresh_token\": \"%s\"\n"
         "}\n",
         cfg->client_id, cfg->client_secret,
         cfg->access_token, cfg->refresh_token,
-        cfg->user_id, cfg->channel_name);
+        cfg->user_id, cfg->channel_name,
+        cfg->youtube_api_key,
+        cfg->yt_client_id, cfg->yt_client_secret,
+        cfg->yt_access_token, cfg->yt_refresh_token);
 
     fclose(f);
 
