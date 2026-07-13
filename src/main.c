@@ -44,7 +44,7 @@ extern char **environ;
 #define MAX_TWITCH_KEYS 14
 #define MAX_YT_KEYS 14
 #define SCROLL_IV 0.033f
-#define FETCH_IV 3
+#define FETCH_IV 1
 #define YT_FETCH_IV 900
 #define YT_VIEWER_IV 60
 #define IDLE_TIMEOUT 60.0
