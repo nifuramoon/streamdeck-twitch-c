@@ -1,16 +1,26 @@
 CC       ?= gcc
-CFLAGS   ?= -O3 -march=native -Wall -Wextra -Wpedantic
-CFLAGS   += -std=c2x -D_GNU_SOURCE -fstack-protector-strong $(EXTRA_CFLAGS)
-LDFLAGS  := $(shell pkg-config --cflags --libs libcurl hidapi-libusb) -lm $(EXTRA_LDFLAGS)
+CFLAGS   ?= -O3 -march=native -flto -fomit-frame-pointer
+CFLAGS   += -std=gnu2x -D_GNU_SOURCE -DNDEBUG
+CFLAGS   += -ffunction-sections -fdata-sections
+CFLAGS   += -Wall -Wextra -Werror=implicit-function-declaration
+CFLAGS   += -Isrc $(shell pkg-config --cflags libcurl hidapi-libusb) $(EXTRA_CFLAGS)
+CFLAGS   += -fstack-protector-strong
+
+LDFLAGS  += -flto -Wl,--gc-sections $(EXTRA_LDFLAGS)
+LDLIBS   += $(shell pkg-config --libs libcurl hidapi-libusb) -lpthread -lm
+
+ifeq ($(DEBUG),1)
+    CFLAGS := $(filter-out -O3 -flto -fomit-frame-pointer -DNDEBUG,$(CFLAGS)) -O0 -g -DDEBUG
+    LDFLAGS := $(filter-out -flto -Wl,--gc-sections,$(LDFLAGS))
+endif
 
 SRC_DIR := src
 OBJ_DIR := obj
 
-STB_URL := https://raw.githubusercontent.com/nothings/stb/master
-STB_DEPS := $(SRC_DIR)/stb_image.h $(SRC_DIR)/stb_image_write.h $(SRC_DIR)/stb_truetype.h
-
 SRCS := $(wildcard $(SRC_DIR)/*.c)
 OBJS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
+DEPS := $(OBJS:.o=.d)
+
 TARGET := streamdeck-twitch
 
 .PHONY: all clean run watchdog
@@ -18,10 +28,10 @@ TARGET := streamdeck-twitch
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
@@ -40,3 +50,5 @@ watchdog: $(TARGET)
 
 clean:
 	rm -rf $(OBJ_DIR) $(TARGET)
+
+-include $(DEPS)
