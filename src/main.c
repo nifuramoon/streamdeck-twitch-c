@@ -44,7 +44,7 @@ extern char **environ;
 #define MAX_TWITCH_KEYS 14
 #define MAX_YT_KEYS 14
 #define SCROLL_IV 0.033f
-#define FETCH_IV 1
+#define FETCH_IV 3
 #define YT_FETCH_IV 900
 #define YT_VIEWER_IV 60
 #define IDLE_TIMEOUT 60.0
@@ -704,6 +704,13 @@ static void render_tw(void) {
 
     if (order_len == 0) return;
 
+    static unsigned char prev_sha[MAX_KEYS][20] = {{0}};
+    static enum page last_page = PAGE_HOME;
+    if (last_page != PAGE_TW) {
+        memset(prev_sha, 0, sizeof(prev_sha));
+        last_page = PAGE_TW;
+    }
+
     static int frame = 0;
     frame++;
     int capture = g_debug_mode && (frame % 30 == 0) ? 1 : 0;
@@ -722,7 +729,21 @@ static void render_tw(void) {
         } else {
             img = key_text_bg("", 0, 0, 0);
         }
-        device_set_key(g_dev, i, img->data, (size_t)72*72*4);
+        uint8_t *d = img->data;
+        unsigned char h[20] = {0};
+        __m128i x0 = _mm_setzero_si128(), x1 = _mm_setzero_si128();
+        for (int j = 0; j < 72*72*4; j += 32) {
+            __m128i v0 = _mm_loadu_si128((__m128i*)(d + j));
+            __m128i v1 = _mm_loadu_si128((__m128i*)(d + j + 16));
+            x0 = _mm_xor_si128(x0, v0);
+            x1 = _mm_xor_si128(x1, v1);
+        }
+        _mm_storeu_si128((__m128i*)h, _mm_xor_si128(x0, x1));
+        h[16] = d[0] ^ d[1]; h[17] = d[2] ^ d[3]; h[18] = d[4]; h[19] = d[5];
+        if (memcmp(h, prev_sha[i], 20) != 0) {
+            memcpy(prev_sha[i], h, 20);
+            device_set_key(g_dev, i, d, (size_t)72*72*4);
+        }
         if (capture) {
             char pname[80];
             snprintf(pname, sizeof(pname), "/tmp/streamdeck/btn%d.png", i);
@@ -731,7 +752,21 @@ static void render_tw(void) {
         image_free(img);
     }
     image *img = key_text_bg("ホーム", 50, 0, 50);
-    device_set_key(g_dev, 14, img->data, (size_t)72*72*4);
+    uint8_t *d = img->data;
+    unsigned char h[20] = {0};
+    __m128i x0 = _mm_setzero_si128(), x1 = _mm_setzero_si128();
+    for (int j = 0; j < 72*72*4; j += 32) {
+        __m128i v0 = _mm_loadu_si128((__m128i*)(d + j));
+        __m128i v1 = _mm_loadu_si128((__m128i*)(d + j + 16));
+        x0 = _mm_xor_si128(x0, v0);
+        x1 = _mm_xor_si128(x1, v1);
+    }
+    _mm_storeu_si128((__m128i*)h, _mm_xor_si128(x0, x1));
+    h[16] = d[0] ^ d[1]; h[17] = d[2] ^ d[3]; h[18] = d[4]; h[19] = d[5];
+    if (memcmp(h, prev_sha[14], 20) != 0) {
+        memcpy(prev_sha[14], h, 20);
+        device_set_key(g_dev, 14, d, (size_t)72*72*4);
+    }
     if (capture) {
         image_save_png(img, "/tmp/streamdeck/btn14.png");
     }
@@ -741,6 +776,14 @@ static void render_tw(void) {
 static void render_yt(void) {
     if (!g_dev) return;
     device_clear_all(g_dev);
+
+    static unsigned char prev_sha[MAX_KEYS][20] = {{0}};
+    static enum page last_page = PAGE_HOME;
+    if (last_page != PAGE_YT) {
+        memset(prev_sha, 0, sizeof(prev_sha));
+        last_page = PAGE_YT;
+    }
+
     static int frame = 0;
     frame++;
     int capture = g_debug_mode && (frame % 30 == 0) ? 1 : 0;
@@ -751,7 +794,21 @@ static void render_yt(void) {
         } else {
             img = key_text_bg("", 0, 0, 0);
         }
-        device_set_key(g_dev, i, img->data, (size_t)72*72*4);
+        uint8_t *d = img->data;
+        unsigned char h[20] = {0};
+        __m128i x0 = _mm_setzero_si128(), x1 = _mm_setzero_si128();
+        for (int j = 0; j < 72*72*4; j += 32) {
+            __m128i v0 = _mm_loadu_si128((__m128i*)(d + j));
+            __m128i v1 = _mm_loadu_si128((__m128i*)(d + j + 16));
+            x0 = _mm_xor_si128(x0, v0);
+            x1 = _mm_xor_si128(x1, v1);
+        }
+        _mm_storeu_si128((__m128i*)h, _mm_xor_si128(x0, x1));
+        h[16] = d[0] ^ d[1]; h[17] = d[2] ^ d[3]; h[18] = d[4]; h[19] = d[5];
+        if (memcmp(h, prev_sha[i], 20) != 0) {
+            memcpy(prev_sha[i], h, 20);
+            device_set_key(g_dev, i, d, (size_t)72*72*4);
+        }
         if (capture) {
             char pname[80];
             snprintf(pname, sizeof(pname), "/tmp/streamdeck/ytbtn%d.png", i);
@@ -760,7 +817,21 @@ static void render_yt(void) {
         image_free(img);
     }
     image *img = key_text_bg("ホーム", 50, 0, 50);
-    device_set_key(g_dev, 14, img->data, (size_t)72*72*4);
+    uint8_t *d = img->data;
+    unsigned char h[20] = {0};
+    __m128i x0 = _mm_setzero_si128(), x1 = _mm_setzero_si128();
+    for (int j = 0; j < 72*72*4; j += 32) {
+        __m128i v0 = _mm_loadu_si128((__m128i*)(d + j));
+        __m128i v1 = _mm_loadu_si128((__m128i*)(d + j + 16));
+        x0 = _mm_xor_si128(x0, v0);
+        x1 = _mm_xor_si128(x1, v1);
+    }
+    _mm_storeu_si128((__m128i*)h, _mm_xor_si128(x0, x1));
+    h[16] = d[0] ^ d[1]; h[17] = d[2] ^ d[3]; h[18] = d[4]; h[19] = d[5];
+    if (memcmp(h, prev_sha[14], 20) != 0) {
+        memcpy(prev_sha[14], h, 20);
+        device_set_key(g_dev, 14, d, (size_t)72*72*4);
+    }
     image_free(img);
 }
 
